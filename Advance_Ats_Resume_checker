@@ -1,1 +1,351 @@
+# resumeATS_final3_fixed.py
+import streamlit as st
+import os
+import re
+import time
+import traceback
+from dotenv import load_dotenv
+from PyPDF2 import PdfReader
+import google.generativeai as genai
+import smtplib
+import ssl
+from email.message import EmailMessage
 
+# -------------------------
+# Load env + init model
+# -------------------------
+load_dotenv()
+API_KEY = os.getenv("GOOGLE_API_KEY")
+if not API_KEY:
+    st.warning("No GOOGLE_API_KEY found. Set it in .env")
+genai.configure(api_key=API_KEY)
+
+DEFAULT_MODEL_NAME = os.getenv("MODEL_NAME", "gemini-2.5-flash")
+EMAIL_USER = os.getenv("EMAIL_USER")
+EMAIL_PASS = os.getenv("EMAIL_PASS")
+
+# -------------------------
+# Helper functions
+# -------------------------
+def send_email(to_email, subject, message):
+    try:
+        msg = EmailMessage()
+        msg["Subject"] = subject
+        msg["From"] = EMAIL_USER
+        msg["To"] = to_email
+        msg.set_content(message)
+        ctx = ssl.create_default_context()
+        with smtplib.SMTP_SSL("smtp.gmail.com", 465, context=ctx) as server:
+            server.login(EMAIL_USER, EMAIL_PASS)
+            server.send_message(msg)
+        return True
+    except Exception as e:
+        st.error(f"Email failed: {e}")
+        return False
+
+def get_gemini_output(pdf_text, prompt, model_name=DEFAULT_MODEL_NAME):
+    try:
+        model = genai.GenerativeModel(model_name)
+        resp = model.generate_content([pdf_text, prompt])
+        if hasattr(resp, "text"):
+            return resp.text
+        if hasattr(resp, "candidates") and resp.candidates:
+            return resp.candidates[0].content.parts[0].text
+        return str(resp)
+    except Exception as e:
+        st.error(f"AI Error: {e}")
+        return "Error generating response."
+
+def read_pdf(uploaded_file):
+    reader = PdfReader(uploaded_file)
+    text = ""
+    for page in reader.pages:
+        text += page.extract_text() or ""
+    return text
+
+def extract_score(text: str):
+    if not text: return None
+    patterns = [r'\b(\d{1,3})\s*\/\s*100\b', r'\b(\d{1,3})\s*out of\s*100\b', r'ATS\D*(\d{1,3})']
+    for p in patterns:
+        m = re.search(p, text, re.IGNORECASE)
+        if m:
+            try:
+                v = int(m.group(1))
+                if 0 <= v <= 100: return v
+            except: continue
+    return None
+
+def display_with_typing(text: str, delay: float = 0.01):
+    placeholder = st.empty()
+    current = ""
+    for line in text.split("\n"):
+        current += line + "\n"
+        placeholder.markdown(current, unsafe_allow_html=True)
+        time.sleep(delay)
+
+# Psychometric Questions
+OPEN_PSY_QUESTIONS = [
+    "Describe a work challenge you faced and how you overcame it.",
+    "What are three strengths you bring to a team?",
+    "Describe how you prioritize tasks when everything is urgent.",
+    "Share an example of feedback you received and how you applied it.",
+    "What motivates you most in your work?"
+]
+LIKERT_PSY_QUESTIONS = [
+    "I handle tight deadlines calmly.",
+    "I proactively seek feedback to improve.",
+    "I enjoy collaborating with others to solve problems.",
+    "I maintain focus on details even under pressure.",
+    "I adapt quickly when project priorities change."
+]
+
+def interpret_likert(score):
+    if score <= 10: return "Low (room for growth)"
+    elif score <= 18: return "Moderate (good foundation)"
+    else: return "High (excellent behavioral fit)"
+
+# Session State Initialization
+for key in ["analysis_done", "response", "ats_score", "history", "psychometric_done",
+            "psychometric_open_answers", "psychometric_likert_answers", "psychometric_score",
+            "psychometric_interpretation"]:
+    if key not in st.session_state:
+        st.session_state[key] = False if "done" in key else \
+                               [] if "answers" in key or key == "history" else \
+                               0 if "score" in key and "ats" not in key else \
+                               "" if "interpretation" in key or key == "response" else None
+
+# -------------------------
+# PERFECT DARK THEME + FIXED UPLOADER
+# -------------------------
+st.set_page_config(page_title="ResumeATS Pro", page_icon="rocket", layout="wide")
+
+st.markdown("""
+<style>
+/* Hide Streamlit defaults */
+#MainMenu, header, footer, [data-testid="stToolbar"] {visibility: hidden !important;}
+
+/* Background */
+html, body, [data-testid="stAppViewContainer"] {
+    background: linear-gradient(135deg, #0f172a 0%, #1e293b 30%, #334155 60%, #475569 100%);
+    background-size: 400% 400%;
+    animation: gradientShift 25s ease infinite;
+    min-height: 100vh;
+    font-family: 'Segoe UI', sans-serif;
+}
+
+/* Glass cards */
+.glass-card, .hero {
+    background: rgba(255,255,255,0.11) !important;
+    backdrop-filter: blur(20px);
+    border-radius: 20px;
+    border: 1px solid rgba(255,255,255,0.18);
+    box-shadow: 0 20px 40px rgba(0,0,0,0.3);
+    padding: 20px;
+    margin: 16px 0;
+    color: #0000FF !important;
+}
+
+/* Text */
+h1,h2,h3,h4,h5,h6,p,div,span,label,.stMarkdown,.stTextInput>div>div>input,
+.stTextArea>div>div>textarea {color:#3B82F6 !important; font-weight:600 !important;}
+
+/* Hero */
+.hero-title {font-size:54px; font-weight:900; color:#fff !important; text-shadow:0 0 40px rgba(96,165,250,0.6);}
+.badge {background:rgba(15,23,42,0.9); color:#e0f2fe !important; padding:12px 26px; border-radius:50px; font-weight:700; border:1px solid rgba(96,165,250,0.5);}
+
+/* Buttons */
+.stButton>button {
+    background: linear-gradient(45deg, #3b82f6, #8b5cf6) !important;
+    color: white !important;
+    border-radius: 16px !important;
+    padding: 16px 36px !important;
+    font-weight: 800 !important;
+    font-size: 17px !important;
+    box-shadow: 0 10px 30px rgba(59,130,246,0.5) !important;
+}
+.stButton>button:hover {transform:translateY(-5px) !important; box-shadow:0 20px 40px rgba(139,92,246,0.7) !important;}
+
+/* FILE UPLOADER - FULLY DARK + BLACK BUTTON */
+.stFileUploader > div > div {
+    background: rgba(15, 23, 42, 0.95) !important;
+    border: 2px dashed #60a5fa !important;
+    border-radius: 18px !important;
+    padding: 40px !important;
+    text-align: center !important;
+}
+.stFileUploader label {color: #e0f2fe !important; font-size: 18px !important; font-weight: 700 !important;}
+
+/* BLACK "Browse files" button */
+.css-1x8t7rt.e1y6u0e0,
+button[kind="secondary"] {
+    background: #000000 !important;
+    color: white !important;
+    border: 2px solid #60a5fa !important;
+    border-radius: 14px !important;
+    padding: 12px 32px !important;
+    font-weight: 800 !important;
+    font-size: 16px !important;
+    box-shadow: 0 0 20px rgba(96,165,250,0.7) !important;
+}
+.css-1x8t7rt.e1y6u0e0:hover,
+button[kind="secondary"]:hover {
+    background: #1a1a1a !important;
+    box-shadow: 0 0 30px rgba(96,165,250,1) !important;
+}
+
+/* Remove white backgrounds */
+.css-1cpxiar, .stFileUploader > div > div > div {background: transparent !important;}
+
+/* Score */
+.score-circle {font-size:72px; font-weight:900; color:#60a5fa !important; text-shadow:0 0 30px rgba(96,165,250,0.8);}
+</style>
+""", unsafe_allow_html=True)
+
+# HERO SECTION
+st.markdown("""
+<div class="hero" style="text-align:center; padding:70px 20px; margin-bottom:40px;">
+    <h1 class="hero-title">ResumeATS Pro</h1>
+    <p style="font-size:22px; color:#cbd5e1; max-width:900px; margin:20px auto;">
+        AI-powered ATS scanner with real-time scoring, optimization tips, and psychometric insights.
+    </p>
+    <div style="display:flex; justify-content:center; gap:16px; flex-wrap:wrap; margin:30px 0;">
+        <div class="badge">Instant ATS Score</div>
+        <div class="badge">Keyword Optimization</div>
+        <div class="badge">Email Reports</div>
+        <div class="badge">Beautiful UI</div>
+    </div>
+</div>
+""", unsafe_allow_html=True)
+
+# INPUT AREA
+c1, c2 = st.columns([1, 1])
+with c1:
+    st.markdown('<div class="glass-card"><h3>Upload Resume (PDF)</h3></div>', unsafe_allow_html=True)
+    upload_file = st.file_uploader("Choose your resume", type="pdf", label_visibility="collapsed")
+with c2:
+    st.markdown('<div class="glass-card"><h3>Job Description (Optional)</h3></div>', unsafe_allow_html=True)
+    job_description = st.text_area("Paste JD here for better suggestions", height=140, label_visibility="collapsed")
+
+st.markdown('<div class="glass-card">', unsafe_allow_html=True)
+analysis_option = st.radio("**Select Analysis Type**", ["Quick Scan", "Detailed Analysis", "ATS Optimization"], horizontal=True)
+st.markdown('</div>', unsafe_allow_html=True)
+
+# ANALYZE BUTTON
+if st.button("Analyze My Resume", use_container_width=True):
+    if upload_file:
+        with st.spinner("Analyzing your resume..."):
+            try:
+                pdf_text = read_pdf(upload_file)
+                prompt_map = {
+                    "Quick Scan": "Quick scan: profession, 3 strengths, 2 improvements, ATS score (0–100)",
+                    "Detailed Analysis": "Detailed: profession, 5 strengths, improvements, section review, ATS score (0–100)",
+                    "ATS Optimization": "ATS Optimization: missing keywords, formatting fixes, suggestions, ATS score (0–100)"
+                }
+                prompt = f"{prompt_map[analysis_option]}\n\nJob Description:\n{job_description}\n\nEnd with: ATS Score: X/100"
+                response = get_gemini_output(pdf_text, prompt)
+                st.session_state.response = response
+                st.session_state.analysis_done = True
+                st.session_state.ats_score = extract_score(response)
+                st.session_state.history.append({"type": analysis_option, "score": st.session_state.ats_score})
+                st.success("Analysis Complete! Psychometric unlocked.")
+            except Exception as e:
+                st.error(f"Error: {e}")
+    else:
+        st.error("Please upload a PDF resume first.")
+
+# TABS
+tab1, tab2, tab3, tab4 = st.tabs(["ATS Report", "Psychometric", "Email Report", "Dashboard"])
+
+with tab1:
+    st.markdown('<div class="glass-card">', unsafe_allow_html=True)
+    if st.session_state.analysis_done:
+        if st.session_state.ats_score is not None:
+            st.markdown(f'<div style="text-align:center; padding:30px;"><div class="score-circle">{st.session_state.ats_score}/100</div></div>', unsafe_allow_html=True)
+            st.progress(st.session_state.ats_score / 100)
+        st.markdown("### AI Feedback")
+        display_with_typing(st.session_state.response)
+    else:
+        st.info("Upload and analyze a resume first.")
+    st.markdown('</div>', unsafe_allow_html=True)
+
+with tab2:
+    st.markdown('<div class="glass-card">', unsafe_allow_html=True)
+    st.markdown("### Psychometric Assessment")
+    if not st.session_state.analysis_done:
+        st.info("Complete resume analysis first to unlock.")
+    elif st.session_state.psychometric_done:
+        st.success("Assessment Completed!")
+        for i, ans in enumerate(st.session_state.psychometric_open_answers):
+            st.markdown(f"**Q{i+1}:** {OPEN_PSY_QUESTIONS[i]}")
+            st.markdown(f"> {ans}")
+        st.markdown(f"**Likert Score:** {st.session_state.psychometric_score}/25 → {st.session_state.psychometric_interpretation}")
+        if st.button("Retake Assessment"):
+            st.session_state.psychometric_done = False
+            st.session_state.psychometric_open_answers = []
+            st.session_state.psychometric_likert_answers = []
+            st.session_state.psychometric_score = 0
+            st.rerun()
+    else:
+        with st.form("psych_form"):
+            st.markdown("**Answer these 5 questions:**")
+            answers = []
+            for i, q in enumerate(OPEN_PSY_QUESTIONS):
+                ans = st.text_area(f"{i+1}. {q}", height=80, key=f"open_{i}")
+                answers.append(ans)
+            st.markdown("**Rate these statements (1 = Strongly Disagree → 5 = Strongly Agree):**")
+            ratings = []
+            for j, q in enumerate(LIKERT_PSY_QUESTIONS):
+                val = st.radio(q, [1,2,3,4,5], horizontal=True, index=2, key=f"likert_{j}")
+                ratings.append(val)
+            if st.form_submit_button("Submit Assessment"):
+                total = sum(ratings)
+                st.session_state.psychometric_open_answers = answers
+                st.session_state.psychometric_likert_answers = ratings
+                st.session_state.psychometric_score = total
+                st.session_state.psychometric_interpretation = interpret_likert(total)
+                st.session_state.psychometric_done = True
+                st.session_state.history.append({"type": "Psychometric", "score": total})
+                st.success("Assessment saved!")
+                st.rerun()
+    st.markdown('</div>', unsafe_allow_html=True)
+
+with tab3:
+    st.markdown('<div class="glass-card">', unsafe_allow_html=True)
+    if st.session_state.analysis_done:
+        email = st.text_input("Your Email Address")
+        include_psy = st.checkbox("Include Psychometric Results", value=True)
+        if st.button("Send Full Report"):
+            if "@" in email and "." in email:
+                body = f"ResumeATS Pro Report\n\nATS Score: {st.session_state.ats_score}/100\n\n{st.session_state.response}"
+                if include_psy and st.session_state.psychometric_done:
+                    body += "\n\nPsychometric Results:\n"
+                    for i, a in enumerate(st.session_state.psychometric_open_answers):
+                        body += f"Q{i+1}: {a}\n"
+                    body += f"\nLikert Score: {st.session_state.psychometric_score}/25 → {st.session_state.psychometric_interpretation}"
+                if send_email(email, "Your ResumeATS Pro Report", body):
+                    st.success("Report sent!")
+            else:
+                st.error("Enter a valid email")
+    else:
+        st.info("Analyze resume first")
+    st.markdown('</div>', unsafe_allow_html=True)
+
+with tab4:
+    st.markdown('<div class="glass-card">', unsafe_allow_html=True)
+    st.markdown("### Your Analytics")
+    if st.session_state.history:
+        ats_scans = [h for h in st.session_state.history if h["score"] is not None and "Psychometric" not in h["type"]]
+        scores = [h["score"] for h in ats_scans]
+        c1, c2, c3 = st.columns(3)
+        c1.metric("Total ATS Scans", len(ats_scans))
+        c2.metric("Average Score", f"{sum(scores)/len(scores):.1f}" if scores else "N/A")
+        c3.metric("Best Score", max(scores) if scores else "N/A")
+        st.markdown("**Recent Activity:**")
+        for item in reversed(st.session_state.history[-10:]):
+            st.write(f"• {item['type']} → {item['score']}")
+    else:
+        st.info("No activity yet")
+    st.markdown('</div>', unsafe_allow_html=True)
+
+# Footer
+st.markdown("<p style='text-align:center; color:#94a3b8; margin-top:60px; font-weight:600;'>Built with love using Gemini + Streamlit</p>", unsafe_allow_html=True)
